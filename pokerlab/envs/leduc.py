@@ -5,7 +5,8 @@ from typing import List, Optional, Tuple, Dict
 import numpy as np
 import sys, os
 
-from encoders import LEDUC_RANKS, LEDUC_DECK, encode_infoset
+from pokerlab.envs.encoders import LEDUC_RANKS, LEDUC_DECK, encode_infoset
+
 
 FOLD, CALL_CHECK, RAISE = 0, 1, 2
 
