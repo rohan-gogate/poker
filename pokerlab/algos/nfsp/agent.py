@@ -1,10 +1,8 @@
 from __future__ import annotations
-import os
-import sys
-import random
+import os, sys, random
 from typing import Optional, Tuple, Iterable
 
-# --- path shim so this works even when run directly ---
+# path shim
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "..", "..", ".."))
 if PROJECT_ROOT not in sys.path:
@@ -15,7 +13,6 @@ import torch
 import torch.nn.functional as F
 from torch import optim
 
-# Absolute imports (now resolvable thanks to the path shim)
 from pokerlab.buffers.replay import ReplayBuffer
 from pokerlab.buffers.reservoir import Reservoir
 from pokerlab.algos.nfsp.QNetwork import QNetwork
@@ -25,8 +22,6 @@ FOLD, CALL_CHECK, RAISE = 0, 1, 2
 
 
 class NFSPAgent:
-    """Minimal NFSP agent (Q-best-response + supervised avg policy)."""
-
     def __init__(
         self,
         obs_dim: int,
@@ -37,7 +32,7 @@ class NFSPAgent:
         gamma: float = 1.0,
         lr_q: float = 1e-3,
         lr_pi: float = 1e-3,
-        epsilon_start: float = 0.12,
+        epsilon_start: float = 0.20,   # a touch more exploration to diversify replay early
         epsilon_final: float = 0.01,
         epsilon_decay: int = 50_000,
         eta: float = 0.1,
@@ -54,22 +49,19 @@ class NFSPAgent:
         self.step_count = 0
         self.rng = random.Random(seed)
 
-        # Memories
         self.mrl = ReplayBuffer(mrl_capacity)
         self.msl = Reservoir(msl_capacity)
 
-        # Networks
         self.q = QNetwork(obs_dim, n_actions).to(self.device)
         self.q_tgt = QNetwork(obs_dim, n_actions).to(self.device)
         self.q_tgt.load_state_dict(self.q.state_dict())
         self.pi = PolicyNetwork(obs_dim, n_actions).to(self.device)
 
-        # Optimizers
         self.opt_q = optim.Adam(self.q.parameters(), lr=lr_q)
         self.opt_pi = optim.Adam(self.pi.parameters(), lr=lr_pi)
         self.target_update = target_update
 
-    # -------- utilities --------
+    # ---- utilities ----
     def _choose_random_legal(self, legal: Iterable[int]) -> int:
         legal = list(legal)
         return legal[self.rng.randrange(len(legal))]
@@ -90,27 +82,19 @@ class NFSPAgent:
         idx = torch.tensor(list(legal), dtype=torch.long, device=probs.device)
         m[idx] = 1.0
         probs = (probs * m)
-        # if all zero (shouldn't happen), fall back to uniform over legal
         if float(probs.sum()) <= 0.0:
             probs = m / m.sum()
         else:
             probs = probs / probs.sum()
         return probs.cpu().numpy()
 
-    # -------- acting --------
-    def act(
-        self,
-        obs: np.ndarray,
-        legal_actions: Iterable[int],
-        as_player: int,
-        use_best_response: Optional[bool] = None,
-    ) -> Tuple[int, bool]:
+    # ---- acting ----
+    def act(self, obs: np.ndarray, legal_actions: Iterable[int], as_player: int, use_best_response: Optional[bool] = None) -> Tuple[int, bool]:
         if use_best_response is None:
             use_best_response = self.rng.random() < self.eta
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
 
         if use_best_response:
-            # ε-greedy over legal actions
             if self.rng.random() < self.epsilon():
                 a = self._choose_random_legal(legal_actions)
             else:
@@ -126,19 +110,19 @@ class NFSPAgent:
             a = int(np.random.choice(self.n_actions, p=probs))
             return a, False
 
-    # -------- storage --------
+    # ---- storage ----
     def store_transition(self, s, a, r, s_next, done):
         self.mrl.add((s, a, r, s_next, done))
 
     def store_supervised(self, s, a):
         self.msl.add((np.asarray(s, dtype=np.float32), int(a)))
 
-    # -------- training --------
+    # ---- training ----
     def train_q(self, batch_size: int = 256):
         if len(self.mrl) < batch_size:
             return 0.0
-        batch = self.mrl.sample(batch_size)
-        s, a, r, s2, d = zip(*batch)
+        s, a, r, s2, d = zip(*self.mrl.sample(batch_size))
+        import torch
         s = torch.as_tensor(np.stack(s), dtype=torch.float32, device=self.device)
         a = torch.as_tensor(a, dtype=torch.int64, device=self.device)
         r = torch.as_tensor(r, dtype=torch.float32, device=self.device)
@@ -162,15 +146,20 @@ class NFSPAgent:
             self.q_tgt.load_state_dict(self.q.state_dict())
         return float(loss.item())
 
-    def train_pi(self, batch_size: int = 256):
+    def train_pi(self, batch_size: int = 256, entropy_coef: float = 0.001):
         if len(self.msl) < batch_size:
             return 0.0
-        batch = self.msl.sample(batch_size)
-        s, a = zip(*batch)
+        s, a = zip(*self.msl.sample(batch_size))
+        import torch
         s = torch.as_tensor(np.stack(s), dtype=torch.float32, device=self.device)
         a = torch.as_tensor(a, dtype=torch.int64, device=self.device)
         logits = self.pi(s)
-        loss = F.cross_entropy(logits, a)
+        ce = F.cross_entropy(logits, a)
+        # optional tiny entropy bonus to avoid overly peaky policy early
+        with torch.no_grad():
+            probs = torch.softmax(logits, dim=-1)
+        entropy = -(probs * (probs.clamp_min(1e-9)).log()).sum(dim=1).mean()
+        loss = ce - entropy_coef * entropy
         self.opt_pi.zero_grad(set_to_none=True)
         loss.backward()
         self.opt_pi.step()
